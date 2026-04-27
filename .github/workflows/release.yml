@@ -2,6 +2,11 @@ name: Release S-UI
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (branch name) e.g. v1.2.3'
+        required: true
+        type: string
   release:
     types: [published]
   push:
@@ -188,15 +193,70 @@ jobs:
           path: ./s-ui-linux-${{ matrix.platform }}.tar.gz
           retention-days: 30
 
-      - name: Upload to Release
-        uses: svenstaro/upload-release-action@v2
-        if: |
-          (github.event_name == 'release' && github.event.action == 'published') ||
-          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+  # New job: create or update a branch with all release assets
+  create-release-branch:
+    name: Create release branch
+    runs-on: ubuntu-latest
+    needs: build-linux   # also implicitly waits for build-frontend because build-linux needs it
+    if: always() && !cancelled() && (needs.build-linux.result == 'success')
+    steps:
+      - name: Determine branch name
+        id: branch_name
+        run: |
+          if [ "${{ github.event_name }}" == "release" ] && [ "${{ github.event.action }}" == "published" ]; then
+            BRANCH="${{ github.event.release.tag_name }}"
+          elif [ "${{ github.event_name }}" == "push" ] && [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            BRANCH="${{ github.ref_name }}"
+          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            BRANCH="${{ inputs.version }}"
+          else
+            echo "Could not determine branch name from event context"
+            exit 1
+          fi
+          if [ -z "$BRANCH" ]; then
+            echo "Branch name is empty"
+            exit 1
+          fi
+          echo "branch_name=$BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          tag: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
-          file: s-ui-linux-${{ matrix.platform }}.tar.gz
-          asset_name: s-ui-linux-${{ matrix.platform }}.tar.gz
-          prerelease: true
-          overwrite: true
+          fetch-depth: 0
+
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: downloaded-artifacts
+
+      - name: Prepare release branch (orphan)
+        run: |
+          set -e
+          BRANCH="${{ steps.branch_name.outputs.branch_name }}"
+          # Create or reset an orphan branch to keep only the release files
+          git switch --orphan "$BRANCH"
+          # Remove any existing files (clean slate)
+          git rm -rf . > /dev/null 2>&1 || true
+          # Create a directory for the assets (optional)
+          mkdir -p release-assets
+          # Copy all downloaded tarballs into release-assets/
+          find downloaded-artifacts -name "*.tar.gz" -exec cp {} release-assets/ \;
+          # Also copy any other relevant files? Only the tarballs.
+          # Add everything
+          git add release-assets/
+          # Configure git user
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Commit only if there are changes
+          if git diff --cached --quiet; then
+            echo "No new files to commit"
+          else
+            git commit -m "Release $BRANCH"
+          fi
+
+      - name: Push release branch
+        run: |
+          BRANCH="${{ steps.branch_name.outputs.branch_name }}"
+          git push origin "$BRANCH" --force
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
